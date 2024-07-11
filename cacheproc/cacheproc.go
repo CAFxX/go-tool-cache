@@ -19,6 +19,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bradfitz/go-tool-cache/wire"
 )
@@ -60,10 +61,10 @@ type Process struct {
 }
 
 func (p *Process) Run() error {
-	br := bufio.NewReader(os.Stdin)
+	br := bufio.NewReaderSize(os.Stdin, 1<<20)
 	jd := json.NewDecoder(br)
 
-	bw := bufio.NewWriter(os.Stdout)
+	bw := bufio.NewWriterSize(os.Stdout, 1<<16)
 	je := json.NewEncoder(bw)
 
 	var caps []wire.Cmd
@@ -82,6 +83,8 @@ func (p *Process) Run() error {
 	}
 
 	var wmu sync.Mutex // guards writing responses
+	var pending atomic.Int32
+	var ft *time.Timer
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -97,7 +100,7 @@ func (p *Process) Run() error {
 		if req.Command == wire.CmdPut && req.BodySize > 0 {
 			// TODO(bradfitz): stream this and pass a checksum-validating
 			// io.Reader that validates on EOF.
-			var bodyb []byte
+			bodyb := make([]byte, 0, req.BodySize)
 			if err := jd.Decode(&bodyb); err != nil {
 				log.Fatal(err)
 			}
@@ -112,9 +115,33 @@ func (p *Process) Run() error {
 			if err := p.handleRequest(ctx, &req, res); err != nil {
 				res.Err = err.Error()
 			}
+
+			pending.Add(1)
 			wmu.Lock()
-			defer wmu.Unlock()
-			je.Encode(res)
+			defer func() {
+				pending.Add(-1) // must happen before the Unlock
+				wmu.Unlock()
+			}()
+			je.Encode(res) // TODO: encode ouside Lock?
+			if pending.Load() > 1 {
+				// Optimization: if we are not the only pending response, skip the flush;
+				// the last pending response will eventually flush, or the bufio.Writer
+				// will fill and trigger an implicit flush, or the flush timer will fire.
+				if ft == nil {
+					// Arm the flush timer.
+					ft = time.AfterFunc(10*time.Millisecond, func() {
+						// TODO: in case of high contention on the mutex force the next
+						// response to flush.
+						wmu.Lock()
+						defer wmu.Unlock()
+						ft = nil
+						bw.Flush()
+					})
+				}
+				return
+			}
+			// In theory here we could also proactively disable the pending flush timer, if
+			// present. But it's probably unnecessary complexity.
 			bw.Flush()
 		}()
 	}
@@ -125,10 +152,10 @@ func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wir
 	default:
 		return errors.New("unknown command")
 	case "close":
-		if p.Close != nil {
-			return p.Close()
+		if p.Close == nil {
+			return nil // no-op
 		}
-		return nil
+		return p.Close()
 	case "get":
 		return p.handleGet(ctx, req, res)
 	case "put":
@@ -175,7 +202,7 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 		return err
 	}
 	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("not a regular file")
+		return errors.New("not a regular file")
 	}
 	res.Size = fi.Size()
 	res.TimeNanos = fi.ModTime().UnixNano()
